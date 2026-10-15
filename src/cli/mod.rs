@@ -9,6 +9,7 @@ use crate::commands::{
 };
 use crate::config::{DEFAULT_API_HOST, DEFAULT_PROFILE_NAME, resolve_config_dir};
 use crate::http::normalize_base_url;
+use crate::mcp;
 use crate::store::sqlite::{Profile, Store};
 
 #[derive(Debug, Parser)]
@@ -30,6 +31,27 @@ enum TopLevelCommand {
     Energy(EnergyCommand),
     Location(LocationCommand),
     Vehicle(VehicleCommand),
+    Mcp(McpCliArgs),
+}
+
+/// Run an MCP server exposing the CLI's operations as streamable-HTTP tools.
+#[derive(Debug, Args)]
+struct McpCliArgs {
+    /// Host interface to bind the MCP HTTP server to.
+    #[arg(long, env = "VC_MCP_HOST", default_value = "0.0.0.0")]
+    host: String,
+
+    /// Port to bind the MCP HTTP server to.
+    #[arg(long, env = "VC_MCP_PORT", default_value_t = 8811)]
+    port: u16,
+
+    /// Bearer token (e.g. a UUID) required on every request as `Authorization: Bearer <token>`.
+    #[arg(long, env = "VC_MCP_BEARER_TOKEN")]
+    bearer_token: Option<String>,
+
+    /// Comma-separated Host header allowlist (e.g. `volvo.example.com:8811`). Unset disables Host validation.
+    #[arg(long, env = "VC_MCP_ALLOWED_HOSTS", value_delimiter = ',')]
+    allowed_hosts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Args)]
@@ -396,6 +418,24 @@ pub async fn run_with_config_dir(config_dir: PathBuf) -> Result<()> {
     let base_url = resolve_base_url(cli.api_host.as_deref(), &profile)?;
 
     match cli.command {
+        TopLevelCommand::Mcp(mcp_args) => {
+            drop(store);
+            mcp::run(mcp::McpServerConfig {
+                host: mcp_args.host,
+                port: mcp_args.port,
+                bearer_token: mcp_args.bearer_token.ok_or_else(|| {
+                    anyhow!(
+                        "a bearer token is required for the MCP server; \
+                         set VC_MCP_BEARER_TOKEN or pass --bearer-token"
+                    )
+                })?,
+                store_path,
+                profile_name: profile.name,
+                base_url,
+                allowed_hosts: mcp_args.allowed_hosts,
+            })
+            .await?;
+        }
         TopLevelCommand::Auth(args) => match args.command {
             AuthSubcommand::Login(login) => {
                 let output = auth_login::execute(
@@ -997,6 +1037,23 @@ mod tests {
     fn location_tree_parses() {
         let get = Cli::try_parse_from(["vc-cli", "location", "get"]);
         assert!(get.is_ok());
+    }
+
+    #[test]
+    fn mcp_subcommand_parses() {
+        let bare = Cli::try_parse_from(["vc-cli", "mcp"]);
+        assert!(bare.is_ok());
+        let with_token = Cli::try_parse_from([
+            "vc-cli",
+            "mcp",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "9000",
+            "--bearer-token",
+            "abc",
+        ]);
+        assert!(with_token.is_ok());
     }
 
     #[test]

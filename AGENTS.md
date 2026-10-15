@@ -67,6 +67,14 @@ When implementing features, start here:
   3. fetch `vehicle list`, cache discovered VINs, and auto-set the single VIN as default
   4. if multiple VINs are available, prompt the user to choose and persist a default
 
+## MCP Server (this fork)
+
+- `vc-cli mcp` serves the full command surface as MCP tools over streamable HTTP (`src/mcp/`).
+- Tool handlers delegate to the same `commands/*` layer as the CLI; keep tool behavior identical to CLI commands when adding endpoints.
+- `VC_MCP_BEARER_TOKEN` (or `--bearer-token`) is mandatory; every `/mcp` request must present `Authorization: Bearer <token>`. `/healthz` is the only unauthenticated endpoint. `VC_MCP_ALLOWED_HOSTS` optionally enables `Host` validation.
+- `Store` wraps the SQLite connection in a `Mutex` (plus a busy timeout) so tool futures stay `Send` while `&Store` is held across awaits; keep that when adding store methods.
+- HTTP-surface regression checks: `scripts/smoke-http.sh` (local) and `scripts/smoke-container.sh` (Docker). Neither needs Volvo credentials.
+
 ## Validation Checklist for New Changes
 
 After implementing a change, verify:

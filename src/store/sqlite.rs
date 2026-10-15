@@ -3,6 +3,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize)]
@@ -45,7 +46,9 @@ pub struct StoredVin {
 }
 
 pub struct Store {
-    conn: Connection,
+    // `Connection` is !Sync; the mutex makes `&Store` safe to share across
+    // async tasks (e.g. MCP tool calls) that await network I/O while holding it.
+    conn: Mutex<Connection>,
 }
 
 impl Store {
@@ -60,16 +63,24 @@ impl Store {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open sqlite database at {}", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context("failed to configure sqlite busy timeout")?;
         conn.execute_batch(include_str!("migrations/0001_init.sql"))
             .context("failed to apply sqlite schema")?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    fn conn(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn get_or_create_profile(&self, name: &str, fallback_base_url: &str) -> Result<Profile> {
         if let Some(profile) = self.get_profile_by_name(name)? {
             return Ok(profile);
         }
-        self.conn
+        self.conn()
             .execute(
                 "INSERT INTO profiles (name, base_url, is_active) VALUES (?1, ?2, 0)",
                 params![name, fallback_base_url],
@@ -80,7 +91,7 @@ impl Store {
     }
 
     pub fn get_profile_by_name(&self, name: &str) -> Result<Option<Profile>> {
-        self.conn
+        self.conn()
             .query_row(
                 "SELECT id, name, base_url, is_active FROM profiles WHERE name = ?1",
                 params![name],
@@ -91,7 +102,7 @@ impl Store {
     }
 
     pub fn get_active_profile(&self) -> Result<Option<Profile>> {
-        self.conn
+        self.conn()
             .query_row(
                 "SELECT id, name, base_url, is_active FROM profiles WHERE is_active = 1 LIMIT 1",
                 [],
@@ -105,10 +116,10 @@ impl Store {
         let profile = self
             .get_profile_by_name(profile_name)?
             .ok_or_else(|| anyhow!("profile `{profile_name}` was not found"))?;
-        self.conn
+        self.conn()
             .execute("UPDATE profiles SET is_active = 0", [])
             .context("failed to clear active profile marker")?;
-        self.conn
+        self.conn()
             .execute(
                 "UPDATE profiles SET is_active = 1 WHERE id = ?1",
                 params![profile.id],
@@ -119,7 +130,7 @@ impl Store {
     }
 
     pub fn set_profile_base_url(&self, profile_id: i64, base_url: &str) -> Result<()> {
-        self.conn
+        self.conn()
             .execute(
                 "UPDATE profiles SET base_url = ?1 WHERE id = ?2",
                 params![base_url, profile_id],
@@ -130,7 +141,7 @@ impl Store {
 
     pub fn save_auth_session(&self, profile_id: i64, token_set: &PersistedTokenSet) -> Result<()> {
         let now = unix_now();
-        self.conn
+        self.conn()
             .execute(
                 "INSERT INTO auth_sessions (
                     profile_id, access_token, refresh_token, scope, token_type, expires_at,
@@ -164,7 +175,7 @@ impl Store {
     }
 
     pub fn get_auth_session(&self, profile_id: i64) -> Result<Option<AuthSession>> {
-        self.conn
+        self.conn()
             .query_row(
                 "SELECT
                     profile_id, access_token, refresh_token, scope, token_type, expires_at,
@@ -190,7 +201,7 @@ impl Store {
     }
 
     pub fn clear_auth_session(&self, profile_id: i64) -> Result<()> {
-        self.conn
+        self.conn()
             .execute(
                 "DELETE FROM auth_sessions WHERE profile_id = ?1",
                 params![profile_id],
@@ -202,14 +213,14 @@ impl Store {
     pub fn upsert_vin(&self, profile_id: i64, vin: &str, set_default: bool) -> Result<()> {
         let vin = normalize_vin(vin)?;
         if set_default {
-            self.conn
+            self.conn()
                 .execute(
                     "UPDATE profile_vins SET is_default = 0 WHERE profile_id = ?1",
                     params![profile_id],
                 )
                 .context("failed to clear previous default VIN")?;
         }
-        self.conn
+        self.conn()
             .execute(
                 "INSERT INTO profile_vins (profile_id, vin, is_default) VALUES (?1, ?2, ?3)
                  ON CONFLICT(profile_id, vin) DO UPDATE SET is_default=excluded.is_default",
@@ -222,7 +233,7 @@ impl Store {
     pub fn set_default_vin(&self, profile_id: i64, vin: &str) -> Result<()> {
         let vin = normalize_vin(vin)?;
         let exists: Option<i64> = self
-            .conn
+            .conn()
             .query_row(
                 "SELECT id FROM profile_vins WHERE profile_id = ?1 AND vin = ?2",
                 params![profile_id, vin],
@@ -235,13 +246,13 @@ impl Store {
                 "VIN `{vin}` is not available for the active profile; run `vehicle list` to discover vehicles"
             ));
         }
-        self.conn
+        self.conn()
             .execute(
                 "UPDATE profile_vins SET is_default = 0 WHERE profile_id = ?1",
                 params![profile_id],
             )
             .context("failed to clear default VIN")?;
-        self.conn
+        self.conn()
             .execute(
                 "UPDATE profile_vins SET is_default = 1 WHERE profile_id = ?1 AND vin = ?2",
                 params![profile_id, vin],
@@ -274,7 +285,7 @@ impl Store {
         let default_vin = requested_default_vin
             .or_else(|| current_default_vin.filter(|current| normalized_vins.contains(current)));
 
-        self.conn
+        self.conn()
             .execute(
                 "DELETE FROM profile_vins WHERE profile_id = ?1",
                 params![profile_id],
@@ -283,7 +294,7 @@ impl Store {
 
         for vin in normalized_vins {
             let is_default = default_vin.as_deref() == Some(vin.as_str());
-            self.conn
+            self.conn()
                 .execute(
                     "INSERT INTO profile_vins (profile_id, vin, is_default) VALUES (?1, ?2, ?3)",
                     params![profile_id, vin, i64::from(is_default)],
@@ -295,8 +306,8 @@ impl Store {
     }
 
     pub fn list_vins(&self, profile_id: i64) -> Result<Vec<StoredVin>> {
-        let mut stmt = self
-            .conn
+        let conn = self.conn();
+        let mut stmt = conn
             .prepare(
                 "SELECT vin, is_default FROM profile_vins
                  WHERE profile_id = ?1 ORDER BY is_default DESC, vin ASC",
@@ -315,7 +326,7 @@ impl Store {
     }
 
     pub fn get_default_vin(&self, profile_id: i64) -> Result<Option<String>> {
-        self.conn
+        self.conn()
             .query_row(
                 "SELECT vin FROM profile_vins WHERE profile_id = ?1 AND is_default = 1 LIMIT 1",
                 params![profile_id],
