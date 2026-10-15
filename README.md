@@ -21,9 +21,12 @@ Every VIN-optional tool falls back to the stored default VIN; tools share the sa
 | `VC_MCP_BEARER_TOKEN` | yes | Bearer token (e.g. a UUID, `uuidgen`). Every `/mcp` request must send `Authorization: Bearer <token>`; the server refuses to start without it. |
 | `VC_MCP_HOST` / `VC_MCP_PORT` | no | Bind address, default `0.0.0.0:8811`. |
 | `VC_MCP_ALLOWED_HOSTS` | no | Comma-separated `Host` header allowlist (DNS-rebinding guard). Unset disables Host validation; bearer auth remains the request gate. |
-| `VOLVO_CONFIG_DIR` | no | State directory (config file + SQLite). Default `~/.config/vc-cli`; the Docker image sets `/data`. |
-| `VCC_API_KEY`, `VOLVO_CLIENT_ID`, `VOLVO_CLIENT_SECRET` | no | Passed through to the API layer (same as the CLI). |
-| `VOLVO_AUTH_ISSUER`, `VOLVO_API_HOST` | no | Region overrides (issuer defaults to the EU host). |
+| `VOLVO_CONFIG_DIR` | no | State directory (SQLite session store). Default `~/.config/vc-cli`; the Docker image sets `/data`. |
+| `VCC_API_KEY` | yes (for reads/commands) | Volvo developer-app API key, sent with every vehicle/energy/location request. |
+| `VOLVO_CLIENT_ID`, `VOLVO_CLIENT_SECRET` | yes (for login/refresh) | OAuth client credentials from the developer app. Persisted inside the SQLite session by `auth login`/`auth token-set`, so the running server only needs them again for a fresh login. |
+| `VOLVO_AUTH_ISSUER`, `VOLVO_API_HOST` | no | Region overrides (issuer defaults to the EU host `https://volvoid.eu.volvocars.com`; NA is `https://volvoid.na.volvocars.com`). |
+
+Credentials come from the environment — no `~/.config/vc-cli/config` file is used (env-provided values are never written to it by `auth login`).
 
 `GET /healthz` is unauthenticated and always returns `ok` for probes.
 
@@ -56,7 +59,8 @@ volumes:
 
 ```bash
 # 1. Login (interactive; open the printed URL, paste the callback URL back).
-#    Stop the server first, or rely on the SQLite busy timeout.
+#    Env credentials take precedence over prompts; nothing is written to a
+#    config file. Can run while the server is up (SQLite busy timeout).
 docker compose run --rm volvo-mcp auth login --headless
 
 # 2. Verify session and vehicles.
